@@ -1,0 +1,14 @@
+{
+  "name": "xq-chess-serv00",
+  "version": "1.0.0",
+  "private": true,
+  "description": "中国象棋（xq.meiaigo.eu.org）serv00 Node.js 版：由 Cloudflare Worker 版 1:1 移植，前端零改动",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "dependencies": {}
+}
