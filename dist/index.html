@@ -6,10 +6,10 @@
 <title>中国象棋</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-html,body{height:100%;overflow:hidden;font-family:'PingFang SC','Microsoft YaHei',sans-serif;background:#1a0f0a;color:#f0e6d3;touch-action:manipulation;user-select:none;-webkit-user-select:none;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;overflow:hidden;font-family:'PingFang SC','Microsoft YaHei',sans-serif;background:#3a2a18;color:#f0e6d3;touch-action:manipulation;user-select:none;-webkit-user-select:none;-webkit-tap-highlight-color:transparent}
 #app{position:fixed;inset:0;display:flex;flex-direction:column}
 
-#lobby{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px;gap:20px}
+#lobby{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px;gap:20px;background:radial-gradient(1100px 520px at 50% -8%,#57402a 0%,#4a361f 55%,#3a2a18 100%)}
 #lobby.hide{display:none}
 .logo{font-size:56px;filter:drop-shadow(0 4px 8px rgba(0,0,0,.4))}
 .title{font-size:32px;font-weight:900;color:#d4a843;letter-spacing:6px}
@@ -221,7 +221,7 @@ body[data-skin="zq"] #roomList>div{background:#ffffff!important;border-color:#bf
 body[data-skin="zhu"] #roomListPanel{background:#1a0909!important;border-color:#5a2a22!important}
 body[data-skin="zhu"] #roomList>div{background:#240d0d!important;border-color:#5a2a22!important}
 /* --- 大厅卡片化美化 --- */
-.lobby-cols .btns{width:100%;max-width:420px;gap:11px;background:#241409;border:1px solid #3d2117;border-radius:16px;padding:14px 14px 12px;box-shadow:0 10px 28px rgba(0,0,0,.35)}
+.lobby-cols .btns{width:100%;max-width:420px;gap:11px;background:#2c1810;border:1px solid #3d2117;border-radius:16px;padding:14px 14px 12px;box-shadow:0 10px 28px rgba(0,0,0,.35)}
 .lobby-cols .btns:first-child::before{content:'⚔ 对弈模式';display:block;font-size:13px;font-weight:800;letter-spacing:4px;color:#d4a843;text-align:center;margin:0 0 10px}
 .lobby-cols .btns>.divider{color:#d4a843;font-size:13px;font-weight:800;letter-spacing:4px;margin:2px 0 4px}
 .lobby-cols .btn{box-shadow:0 2px 10px rgba(0,0,0,.28)}
