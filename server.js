@@ -357,6 +357,11 @@ function saveAiToStore() {
  * 房间（Durable Object ChessRoom 的 1:1 移植）
  * ========================================================================*/
 const rooms = new Map(); // roomId -> ChessRoom
+/* 2026-11-10 诊断计数，/api/health 暴露；日志带 ISO 时间，便于晚高峰定位 */
+const diag = { conns: 0, reconnects: 0, rejects: 0, moveRejects: 0, maxSockets: 0, leaks: 0 };
+function logx(tag, msg) {
+  try { console.log(new Date().toISOString() + ' [' + tag + '] ' + msg); } catch (e) {}
+}
 function getRoom(roomId) {
   let room = rooms.get(roomId);
   if (!room) {
@@ -372,6 +377,11 @@ var ChessRoom = class {
     this.room = null;
     this.disconnected = {};
     this._cleanupTimer = null;
+    // 2026-11-10 座位治理：连接级 sid + 最后消息时间 + 活连接集合
+    // 对应 x 站 Durable Object 的 sid / _lastMsg / getWebSockets()
+    this._lastMsg = new Map();
+    this._sockets = new Set();
+    this._lastActive = Date.now();
     this.ctx = {
       waitUntil: (p) => { if (p && typeof p.catch === 'function') p.catch(() => {}); }
     };
@@ -461,9 +471,14 @@ var ChessRoom = class {
     }).catch(() => {});
   }
   handleRoomWebSocket(ws) {
-    const socketData = { color: null, spectator: false, replaced: false };
+    // 每个连接一个 sid：老连接即使 close 事件迟到，也不会误删新座位的连接
+    const sid = Math.random().toString(36).slice(2) + Date.now().toString(36);
+    const socketData = { color: null, spectator: false, replaced: false, sid };
     ws._socketData = socketData;
+    ws._sid = sid;
     ws._lastSeen = Date.now();
+    this._sockets.add(ws);
+    this._lastMsg.set(sid, Date.now());
     let heartbeatTimer = null;
     let heartbeatTimeout = null;
     const startHeartbeat = () => {
@@ -484,6 +499,8 @@ var ChessRoom = class {
     ws.onmessage = async (event) => {
       try {
         ws._lastSeen = Date.now();
+        if (socketData.sid) this._lastMsg.set(socketData.sid, Date.now());
+        this._lastActive = Date.now();
         const data = JSON.parse(event.data);
         const eventName = data.event || data[0];
         const payload = data.payload || data[1];
@@ -518,6 +535,8 @@ var ChessRoom = class {
             this.room.players.set(ws, { id: Math.random().toString(36).slice(2), color: myColor, assignedAt: Date.now() });
             socketData.color = myColor;
             ws.send(JSON.stringify({ event: 'room_created', data: { roomId: this.room.id, color: myColor, pid: myPid } }));
+            diag.conns++;
+            logx('建房', this.room.id + ' ' + myColor + ' sid=' + socketData.sid);
             this.ctx.waitUntil(this._regUpdate(this.room.players.size >= 2 ? 'playing' : 'waiting'));
           } else {
             let myColor;
@@ -530,6 +549,8 @@ var ChessRoom = class {
             this.room.players.set(ws, { id: Math.random().toString(36).slice(2), color: myColor, assignedAt: Date.now() });
             socketData.color = myColor;
             ws.send(JSON.stringify({ event: 'room_created', data: { roomId: this.room.id, color: myColor, pid: myPid } }));
+            diag.conns++;
+            logx('建房', this.room.id + ' ' + myColor + ' sid=' + socketData.sid);
             this.ctx.waitUntil(this._regUpdate(this.room.players.size >= 2 ? 'playing' : 'waiting'));
           }
         } else if (eventName === 'join_room') {
@@ -558,16 +579,22 @@ var ChessRoom = class {
           socketData.color = color;
           if (this.room.players.size >= 2) this.room.gameStarted = true;
           ws.send(JSON.stringify({ event: 'room_joined', data: { roomId: this.room.id, color, pid: joinPid } }));
+          diag.conns++;
+          logx('加入', this.room.id + ' ' + color + ' sid=' + socketData.sid);
           this.broadcastRoomState();
           this.broadcastToPlayers(JSON.stringify({ event: 'game_start', data: { currentTurn: this.room.currentTurn } }));
           this.startRoomTimer();
           this.ctx.waitUntil(this._regUpdate(this.room.players.size >= 2 ? 'playing' : 'waiting'));
         } else if (eventName === 'make_move') {
           if (!this.room || this.room.gameOver) {
+            diag.moveRejects++;
+            logx('拒走', 'invalid_state(gameOver) sid=' + socketData.sid);
             ws.send(JSON.stringify({ event: 'move_rejected', data: { reason: 'invalid_state' } }));
             return;
           }
           if (this.room.players.size < 2 && this.room.moveHistory.length === 0 && !this.room.gameStarted) {
+            diag.moveRejects++;
+            logx('拒走', 'invalid_state(no-start) sid=' + socketData.sid);
             ws.send(JSON.stringify({ event: 'move_rejected', data: { reason: 'invalid_state' } }));
             return;
           }
@@ -577,6 +604,8 @@ var ChessRoom = class {
             }
           }
           if (!socketData.color) {
+            diag.moveRejects++;
+            logx('拒走', 'no_color sid=' + socketData.sid);
             ws.send(JSON.stringify({ event: 'move_rejected', data: { reason: 'no_color' } }));
             return;
           }
@@ -589,6 +618,8 @@ var ChessRoom = class {
             return;
           }
           if (this.room.currentTurn !== socketData.color) {
+            diag.moveRejects++;
+            logx('拒走', 'not_your_turn turn=' + this.room.currentTurn + ' me=' + socketData.color + ' sid=' + socketData.sid);
             ws.send(JSON.stringify({ event: 'move_rejected', data: { reason: 'not_your_turn' } }));
             return;
           }
@@ -704,6 +735,8 @@ var ChessRoom = class {
             try { await this.initRoom(this.roomId); } catch (e2) {}
           }
           if (!this.room) return;
+          this._pruneSockets();
+          const liveSids = this._liveSids();
           const otherEntries = [...this.room.players.entries()].filter(([pws]) => pws !== ws);
           const isReplaceable = (c) => otherEntries.some(([pws, p]) => p.color === c && (pws.readyState === WS.CLOSED || pws.readyState === WS.CLOSING || pws.readyState === WS.CONNECTING || this.disconnected && this.disconnected[c]));
           const isFree = (c) => !otherEntries.some(([, p]) => p.color === c);
@@ -719,13 +752,18 @@ var ChessRoom = class {
               if (sameColorEntry) {
                 const [hws, seat] = sameColorEntry;
                 const pidMatches2 = !!(payload.pid && this.room.playerTokens && this.room.playerTokens[color] === payload.pid);
-                const holderDead = hws.readyState !== 1 || hws._socketData && hws._socketData.replaced;
-                const holderIdle = !hws._lastSeen || Date.now() - hws._lastSeen > 25e3;
+                const holderSid = hws._socketData && hws._socketData.sid;
+                // 与 x 站 cf-chess.js 的 holderDead 判定对齐：
+                // 座位持有者不在活连接集合、已被替换、或 60s 没发过任何消息 -> 视为死座
+                const holderDead = !holderSid || !liveSids.has(holderSid) || (hws._socketData && hws._socketData.replaced) || this._staleSid(holderSid);
+                const holderIdle = false;
                 const preDiscSeat = !!(this.disconnected && this.disconnected[color] && seat.assignedAt && this.disconnected[color] > seat.assignedAt);
                 if (!pidMatches2 && !holderDead && !holderIdle && !preDiscSeat) {
                   const alt2 = color === 'red' ? 'black' : 'red';
                   if (isFree(alt2) || isReplaceable(alt2)) { color = alt2; }
                   else {
+                    diag.rejects++;
+                    logx('拒绝', this.room.id + ' ' + color + ' 房间已满(alt) sid=' + sid);
                     ws.send(JSON.stringify({ event: 'error', data: '\u623F\u95F4\u5DF2\u6EE1\uFF0C\u65E0\u6CD5\u91CD\u8FDE' }));
                     try { ws.close(); } catch (e2) {}
                     return;
@@ -735,6 +773,8 @@ var ChessRoom = class {
                 const alt = color === 'red' ? 'black' : 'red';
                 if (isFree(alt) || isReplaceable(alt)) { color = alt; }
                 else {
+                  diag.rejects++;
+                  logx('拒绝', this.room.id + ' ' + color + ' 房间已满(no-seat) sid=' + sid);
                   ws.send(JSON.stringify({ event: 'error', data: '\u623F\u95F4\u5DF2\u6EE1\uFF0C\u65E0\u6CD5\u91CD\u8FDE' }));
                   try { ws.close(); } catch (e) {}
                   return;
@@ -771,6 +811,8 @@ var ChessRoom = class {
           }
           this.room.players.set(ws, { id: Math.random().toString(36).slice(2), color, assignedAt: Date.now() });
           socketData.color = color;
+          diag.reconnects++;
+          logx('重连', this.room.id + ' ' + color + ' pid=' + (pidMatches ? 'ok' : 'rotated') + ' sid=' + sid);
           if (this.room.players.size >= 2) this.room.gameStarted = true;
           const gameInProgress = !this.room.gameOver && this.room.moveHistory.length > 0;
           try {
@@ -815,6 +857,9 @@ var ChessRoom = class {
           try { store.deleteRoomState(room.id); } catch (e) {}
           if (this._cleanupTimer) { clearTimeout(this._cleanupTimer); this._cleanupTimer = null; }
           this.disconnected = {};
+          this._lastActive = Date.now();
+          rooms.delete(this.roomId);
+          logx('解散', this.roomId);
         }
       } catch (e) {
         console.error('Room WebSocket message error:', e);
@@ -822,6 +867,8 @@ var ChessRoom = class {
     };
     ws.onclose = () => {
       stopHeartbeat();
+      this._sockets.delete(ws);
+      if (socketData.sid) this._lastMsg.delete(socketData.sid);
       if (socketData.spectator) {
         if (this.room) this.room.spectators.delete(ws);
         return;
@@ -829,6 +876,7 @@ var ChessRoom = class {
       if (!this.room || !socketData.color) return;
       if (socketData.replaced) return;
       this.room.players.delete(ws);
+      logx('断开', this.roomId + ' ' + socketData.color + ' sid=' + socketData.sid);
       if (this.room._timer) { clearInterval(this.room._timer); this.room._timer = null; }
       this.disconnected[socketData.color] = Date.now();
       this.broadcastToOpponent(ws, JSON.stringify({ event: 'player_disconnected', data: { color: socketData.color } }));
@@ -843,6 +891,7 @@ var ChessRoom = class {
               this.room.gameOver = true;
               this.room._gameEndedAt = now;
               this.room.winner = color === 'red' ? 'black' : 'red';
+              logx('判负', this.roomId + ' ' + color + ' 断线超过180s');
               this.broadcastToRoom(JSON.stringify({ event: 'game_over', data: { winner: this.room.winner, reason: 'disconnect_timeout' } }));
               this.broadcastToRoom(JSON.stringify({ event: 'room_timeout', data: {} }));
               if (this.room._timer) { clearInterval(this.room._timer); this.room._timer = null; }
@@ -857,6 +906,49 @@ var ChessRoom = class {
     ws.onerror = () => {
       stopHeartbeat();
     };
+  }
+  /* ===== 2026-11-10 座位治理（对齐 x 站 cf-chess.js 的 sid/_staleSid/_syncSockets） ===== */
+  _liveSids() {
+    const s = new Set();
+    try {
+      for (const ws of this._sockets) {
+        if (ws.readyState !== 1) continue;
+        const d = ws._socketData;
+        if (d && d.sid && !d.replaced) s.add(d.sid);
+      }
+    } catch (e) {}
+    return s;
+  }
+  _staleSid(sid) {
+    if (!sid) return false;
+    const t = this._lastMsg.get(sid);
+    if (!t) return false;
+    return Date.now() - t > 6e4; // 60s 无任何消息 = 僵死
+  }
+  _hasLiveHolder(color, exceptWs) {
+    try {
+      for (const ws of this._sockets) {
+        if (ws === exceptWs || ws.readyState !== 1) continue;
+        const d = ws._socketData;
+        if (d && d.color === color && !d.spectator && !d.replaced) return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+  _pruneSockets() {
+    try {
+      for (const ws of this._sockets) {
+        if (ws.readyState === 2 || ws.readyState === 3) this._sockets.delete(ws);
+      }
+      if (this.room) {
+        for (const [pws] of [...this.room.players]) {
+          if (pws.readyState === 2 || pws.readyState === 3) {
+            if (pws._socketData) pws._socketData.replaced = true;
+            this.room.players.delete(pws);
+          }
+        }
+      }
+    } catch (e) {}
   }
   broadcastToRoom(msg) {
     if (!this.room) return;
@@ -1073,6 +1165,12 @@ async function handleApiRequest(req, res, url) {
       'Access-Control-Allow-Headers': 'Content-Type'
     });
     res.end();
+    return;
+  }
+  if (p === '/api/health') {
+    let sockets = 0;
+    for (const rm of rooms.values()) { if (rm._sockets) sockets += rm._sockets.size; }
+    jsonRes(res, { ok: true, ts: Date.now(), version: '2026-11-10', uptime: Math.round(process.uptime()), rooms: rooms.size, sockets, online: onlineCount, diag });
     return;
   }
   loadAiFromStore();
@@ -1345,6 +1443,18 @@ setInterval(() => {
     store.pruneOnline(3e5);      // 在线记录 5 分钟过期
     store.pruneRegistry(12e5);   // 房间列表 20 分钟窗口
     store.pruneRoomState(36e5);  // 房间状态 1 小时 TTL
+    // 2026-11-10：回收空房间实例，避免 34 天常驻进程 rooms Map 无限增长
+    for (const [rid, rm] of rooms) {
+      const noRoom = !rm.room;
+      const noSock = !rm._sockets || rm._sockets.size === 0;
+      if (noRoom && noSock && Date.now() - (rm._lastActive || 0) > 6e5) {
+        rooms.delete(rid);
+        diag.leaks++;
+      }
+    }
+    for (const rm of rooms.values()) {
+      if (rm._sockets && rm._sockets.size > diag.maxSockets) diag.maxSockets = rm._sockets.size;
+    }
   } catch (e) {}
 }, 60e3).unref();
 
@@ -1358,7 +1468,7 @@ store.load();
 store.pruneOnline(3e5); // 启动时清掉上次进程遗留的在线记录
 
 server.listen(PORT, HOST, () => {
-  console.log('[xq] 中国象棋服务已启动: http://' + HOST + ':' + PORT + ' (dist=' + DIST_DIR + ')');
+  console.log('[xq] 中国象棋服务已启动: http://' + HOST + ':' + PORT + ' (dist=' + DIST_DIR + ') ver=2026-11-10-seatfix');
   if (!fs.existsSync(path.join(DIST_DIR, 'index.html'))) {
     console.warn('[xq] 警告: dist/index.html 不存在，请确认部署目录结构');
   }

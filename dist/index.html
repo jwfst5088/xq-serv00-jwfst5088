@@ -1738,10 +1738,22 @@ stopTimer();engine.gameOver=true;engine.winner=d.winner;showGameOver(d.winner===
 socket.on('player_disconnected',function(d){
 	if(gm==='online'&&myRm){
 		hideOverlay();
+		try{
+			if(engine.gameOver)return;
+			var tt=D('turnText');if(tt)tt.textContent='对手断线，180秒后判你获胜';
+			if(window._dcTimer)clearInterval(window._dcTimer);
+			var _dc=180;
+			window._dcTimer=setInterval(function(){
+				_dc--;
+				if(_dc<=0){clearInterval(window._dcTimer);window._dcTimer=null;return;}
+				try{var t2=D('turnText');if(t2&&!engine.gameOver)t2.textContent='对手断线，'+_dc+'秒后判你获胜';}catch(e){}
+			},1000);
+		}catch(e){}
 	}
 });
 socket.on('player_reconnected',function(d){
 	if(window._dcTimer){clearInterval(window._dcTimer);window._dcTimer=null;}
+	try{var tt=D('turnText');if(tt&&!engine.gameOver)tt.textContent=(engine.currentTurn==='red')?'红方走棋':'黑方走棋';}catch(e){}
 	hideOverlay();hideReconnecting();
 });
 socket.on('room_state',function(d){
@@ -6518,6 +6530,6 @@ try{var _xqOrigConnectSocket=window.connectSocket;if(typeof _xqOrigConnectSocket
 try{setTimeout(function(){_xqLoadRooms();},800);}catch(e){}
 try{setInterval(function(){try{if(socket&&socket.connected)_xqLoadRooms();}catch(e){}},15000);}catch(e){}
 </script>
-<script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v4513226cdae34746b4dedf0b4dfa099e1781791509496" integrity="sha512-ZE9pZaUXND66v380QUtch/5sE9tPFh2zg45pR2PB0CVkCtOREv2AJKkSidISWkysEuQ0EH8faUU5du78bx87UQ==" data-cf-beacon='{"version":"2024.11.0","token":"0a4ff2af697e451c85fdf620787d507c","r":1}' crossorigin="anonymous"></script>
+
 </body>
 </html>
