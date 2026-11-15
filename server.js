@@ -359,6 +359,23 @@ function saveAiToStore() {
  * 房间（Durable Object ChessRoom 的 1:1 移植）
  * ========================================================================*/
 const rooms = new Map(); // roomId -> ChessRoom
+/* 2026-11-16 防"死房复活"：旧实现 getRoom() 对任何 ?roomId= 连接都无条件建房间，
+   于是房间判负解散后，前端刷新/自动重连又把它造出来（表现：房间一直在、刷新还有）。
+   现在只有「大厅新建」或「内存里还活着 / 有未过期存档」的房号才允许建立实例。 */
+const pendingRooms = new Map(); // roomId -> 允许建房的截止时间
+const ROOM_CREATE_TTL = 6e4;
+function _roomRecoverable(roomId) {
+  if (rooms.has(roomId)) return true;
+  if (pendingRooms.has(roomId)) {
+    if (pendingRooms.get(roomId) > Date.now()) return true;
+    pendingRooms.delete(roomId);
+  }
+  try {
+    const saved = store.getRoomState(roomId);
+    if (saved && saved.createdAt && Date.now() - saved.createdAt < 36e5 && !saved.gameOver) return true;
+  } catch (e) {}
+  return false;
+}
 /* 2026-11-10 诊断计数，/api/health 暴露；日志带 ISO 时间，便于晚高峰定位 */
 const diag = { conns: 0, reconnects: 0, rejects: 0, moveRejects: 0, maxSockets: 0, leaks: 0 };
 function logx(tag, msg) {
@@ -1173,6 +1190,7 @@ async function handleLobbyWebSocket(ws) {
           requestedRoomId = payload;
         }
         const roomId = requestedRoomId || Math.random().toString(36).slice(2, 8).toUpperCase();
+        pendingRooms.set(roomId, Date.now() + ROOM_CREATE_TTL);
         ws.send(JSON.stringify({ event: 'redirect_room', data: { roomId, action: 'create', lastColor } }));
       } else if (eventName === 'ping') {
         try { ws.send(JSON.stringify({ event: 'pong' })); } catch (e) {}
@@ -1182,6 +1200,12 @@ async function handleLobbyWebSocket(ws) {
         }
       } else if (eventName === 'join_room') {
         const roomId = payload;
+        if (!roomId) return;
+        // 2026-11-16 加入一个不存在/已解散的房间要明确报错，不能顺手造出幽灵房间
+        if (!_roomRecoverable(roomId)) {
+          ws.send(JSON.stringify({ event: 'error', data: '\u623F\u95F4\u4E0D\u5B58\u5728' }));
+          return;
+        }
         ws.send(JSON.stringify({ event: 'redirect_room', data: { roomId, action: 'join' } }));
       } else if (eventName === 'reconnect_room') {
         const roomId = payload.roomId;
@@ -1504,7 +1528,14 @@ server.on('upgrade', (req, socket, head) => {
       roomId = u.searchParams.get('roomId');
     } catch (e) {}
     if (roomId) {
-      getRoom(roomId).handleConnection(conn);
+      if (!_roomRecoverable(roomId)) {
+        // 已判负解散/从未存在过的房间：明确告知前端，不再凭空造房（否则刷新就"复活"）
+        try { conn.send(JSON.stringify({ event: 'error', data: '\u672C\u5C40\u5DF2\u7ED3\u675F' })); } catch (e) {}
+        setTimeout(() => { try { conn.close(); } catch (e) {} }, 60);
+      } else {
+        pendingRooms.delete(roomId);
+        getRoom(roomId).handleConnection(conn);
+      }
     } else {
       handleLobbyWebSocket(conn);
     }
@@ -1520,6 +1551,7 @@ setInterval(() => {
     store.pruneOnline(3e5);      // 在线记录 5 分钟过期
     store.pruneRegistry(12e5);   // 房间列表 20 分钟窗口
     store.pruneRoomState(36e5);  // 房间状态 1 小时 TTL
+    for (const [rid, exp] of pendingRooms) { if (exp < Date.now()) pendingRooms.delete(rid); }
     // 2026-11-10：回收空房间实例，避免 34 天常驻进程 rooms Map 无限增长
     for (const [rid, rm] of rooms) {
       const noRoom = !rm.room;
