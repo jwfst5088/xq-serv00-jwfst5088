@@ -254,6 +254,7 @@ class WSConn {
       }
       case 0x8: { // close
         const code = f.payload && f.payload.length >= 2 ? f.payload.readUInt16BE(0) : 1005;
+        this._peerCloseCode = code;
         this._sendCloseFrame(code);
         break;
       }
@@ -279,6 +280,7 @@ class WSConn {
   _sendCloseFrame(code) {
     if (this._closeSent) return;
     this._closeSent = true;
+    this._closeCode = code || 1000;
     this.readyState = WS.CLOSING;
     const body = Buffer.alloc(2);
     body.writeUInt16BE(code || 1000, 0);
@@ -290,7 +292,7 @@ class WSConn {
     if (this._closeFired) return;
     this._closeFired = true;
     this.readyState = WS.CLOSED;
-    if (this.onclose) { try { this.onclose({}); } catch (e) {} }
+    if (this.onclose) { try { this.onclose({ code: this._closeCode || this._peerCloseCode || 1006, peer: this._peerCloseCode }); } catch (e) {} }
   }
   send(str) {
     if (this.readyState !== WS.OPEN) return;
@@ -499,7 +501,8 @@ var ChessRoom = class {
         if (heartbeatTimeout) { clearTimeout(heartbeatTimeout); heartbeatTimeout = null; }
         try { ws.send(JSON.stringify({ event: 'ping' })); } catch (e) {}
         heartbeatTimeout = setTimeout(() => {
-          try { ws.close(); } catch (e) {}
+          ws._closeReason = 'heartbeat_timeout';
+          try { ws.close(4000); } catch (e) {}
         }, 6e4);
       }, 3e4);
     };
@@ -564,7 +567,7 @@ var ChessRoom = class {
             let myColor = existingColor === 'red' ? 'black' : 'red';
             const takenByLive = [...this.room.players.entries()].some(([pws2, p2]) => p2.color === myColor && pws2 !== ws && !(pws2._socketData && pws2._socketData.replaced));
             if (takenByLive) myColor = myColor === 'red' ? 'black' : 'red';
-            const stillTaken = [...this.room.players.values()].some((p2) => p2.color === myColor);
+            const stillTaken = [...this.room.players.entries()].some(([pws2, p2]) => p2.color === myColor && pws2 !== ws);
             if (stillTaken) {
               ws.send(JSON.stringify({ event: 'error', data: '\u623F\u95F4\u5DF2\u6EE1' }));
               return;
@@ -925,7 +928,7 @@ var ChessRoom = class {
         console.error('Room WebSocket message error:', e);
       }
     };
-    ws.onclose = () => {
+    ws.onclose = (ev) => {
       stopHeartbeat();
       this._sockets.delete(ws);
       if (socketData.sid) this._lastMsg.delete(socketData.sid);
@@ -936,7 +939,9 @@ var ChessRoom = class {
       if (!this.room || !socketData.color) return;
       if (socketData.replaced) return;
       this.room.players.delete(ws);
-      logx('断开', this.roomId + ' ' + socketData.color + ' sid=' + socketData.sid);
+      logx('断开', this.roomId + ' ' + socketData.color + ' sid=' + socketData.sid
+        + ' code=' + (ev && ev.code)
+        + ' reason=' + (ws._closeReason || (ev && ev.peer ? 'peer_close' : '-')));
       if (this.room._timer) { clearInterval(this.room._timer); this.room._timer = null; }
       this.disconnected[socketData.color] = Date.now();
       this.broadcastToOpponent(ws, JSON.stringify({ event: 'player_disconnected', data: { color: socketData.color } }));
