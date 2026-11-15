@@ -45,16 +45,50 @@ class SocketClient {
 
   _startPing() {
     this._stopPing();
+    this._lastPong = Date.now();
     this._pingTimer = setInterval(() => {
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+      // 判定连接已死：连续 pingTimeout 内没收到任何 pong。
+      // 旧实现每次发 ping 都 clearTimeout+重设 pongTimer，而 pingInterval(4s) < pingTimeout(8s)，
+      // 计时器永远被刷新、永不到期 —— 网络静默断开时前端永远发现不了，也就永远不会重连。
+      if (Date.now() - this._lastPong > this.pingTimeout) {
+        this._forceReconnect('pong_timeout');
+        return;
+      }
       try { this.ws.send(JSON.stringify({ event: 'ping' })); } catch (e) {}
-      if (this._pongTimer) clearTimeout(this._pongTimer);
-      this._pongTimer = setTimeout(() => {
-        if (this.ws) {
-          try { this.ws.close(); } catch (e) {}
-        }
-      }, this.pingTimeout);
     }, this.pingInterval);
+  }
+
+  // 主动判死并重建连接：网络静默（拔网线/切 WiFi/丢包）时浏览器不会及时触发 onclose，
+  // 不能只 ws.close() 干等 TCP 超时，否则表现就是"断线后再也回不来"。
+  _forceReconnect(reason) {
+    if (this._forceReconnecting) return;
+    this._forceReconnecting = true;
+    const dead = this.ws;
+    this.ws = null;
+    if (dead) {
+      dead.onclose = null;
+      dead.onerror = null;
+      dead.onmessage = null;
+      try { dead.close(); } catch (e) {}
+    }
+    if (this._pingTimer) { clearInterval(this._pingTimer); this._pingTimer = null; }
+    if (this._pongTimer) { clearTimeout(this._pongTimer); this._pongTimer = null; }
+    this.connected = false;
+    this.connecting = false;
+    console.warn('SocketClient 判定连接已死(' + reason + ')，主动重建');
+    this._trigger('disconnect');
+    if (this.reconnection) {
+      if (this._reconnectTimer) clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = setTimeout(() => {
+        this._reconnectTimer = null;
+        this._forceReconnecting = false;
+        this.reconnectAttempts++;
+        this.connect();
+      }, this.reconnectDelay);
+    } else {
+      this._forceReconnecting = false;
+    }
   }
 
   _stopPing() {
@@ -90,6 +124,7 @@ class SocketClient {
       if (this._connectTimer) { clearTimeout(this._connectTimer); this._connectTimer = null; }
       this.connected = true;
       this.connecting = false;
+      this._forceReconnecting = false;
       this.reconnectAttempts = 0;
       this._lastPong = Date.now();
       this._startPing();
