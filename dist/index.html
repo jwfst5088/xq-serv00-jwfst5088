@@ -1843,6 +1843,16 @@ socket.on('draw_rejected',function(){toast('对方拒绝了求和');});
 socket.on('rematch_requested',function(){showOverlay('<h2>对方请求再来一局</h2><p>是否同意重新开始？</p><div class="btns2"><button class="btn btn-green" style="width:auto;padding:10px 20px;font-size:14px" onclick="acceptRematch()">同意</button><button class="btn btn-outline" style="width:auto;padding:10px 20px;font-size:14px" onclick="leaveGame()">拒绝并退出</button></div>');});
 socket.on('rematch_start',function(){hideOverlay();undoUsed=false;pendingMove=null;if(pendingRetryTimer){clearTimeout(pendingRetryTimer);pendingRetryTimer=null;}engine.initBoard();engine.currentTurn='red';engine.gameOver=false;engine.winner=null;engine.moveHistory=[];capRed=[];capBlk=[];lastMove=null;selected=null;validMoves=[];gameStarted=true;clickCount=0;D('turnText').textContent='红方走棋';updateBoardSize();drawBoardBg();render();startTimer();toast('再来一局!',1500);sndStart();saveGameState();});
 socket.on('error', function(msg){
+    // 2026-11-16 房间已判负解散 / 房号不存在：直接回大厅，不再重连重试，
+    // 否则前端会一直把死房"复活"，表现为刷新后房间还在。
+    if(msg==='本局已结束'||msg==='房间不存在'){
+        window._pendingReconnect=null;
+        try{clearGameState();}catch(e){}
+        try{localStorage.removeItem('xq_pid');}catch(e){}
+        try{toast(msg==='本局已结束'?'本局已结束，已返回大厅':'房间不存在，已返回大厅',3000);}catch(e){}
+        try{leaveGameSilent();}catch(e){}
+        return;
+    }
     if(gm==='online'&&myRm&&(msg==='房间已不存在'||msg==='无法重连'||msg.indexOf('无法重连')>=0)){
         // 不自动退出，启动重连重试
         showReconnecting();
