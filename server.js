@@ -382,6 +382,7 @@ var ChessRoom = class {
     this._lastMsg = new Map();
     this._sockets = new Set();
     this._lastActive = Date.now();
+    this._roomReady = null; // 2026-11-15 单飞锁：并发连接只初始化一次房间（对齐 x 站 _roomReady）
     this.ctx = {
       waitUntil: (p) => { if (p && typeof p.catch === 'function') p.catch(() => {}); }
     };
@@ -406,7 +407,9 @@ var ChessRoom = class {
       };
       try {
         const saved = store.getRoomState(roomId);
-        if (saved && saved.createdAt && Date.now() - saved.createdAt < 36e5) {
+        // 2026-11-15 不恢复已结束的残局（对齐 x 站：结束后 room_state 即删除），
+        // 否则同号房间复用/刷新会恢复出上一局终盘 -> 前端"变盘"
+        if (saved && saved.createdAt && Date.now() - saved.createdAt < 36e5 && !saved.gameOver) {
           this.room.currentTurn = saved.currentTurn || 'red';
           this.room.gameOver = saved.gameOver || false;
           this.room.winner = saved.winner || null;
@@ -426,6 +429,9 @@ var ChessRoom = class {
   async _saveRoomState() {
     if (!this.room) return;
     try {
+      // 2026-11-15 对齐 x 站 cf-chess.js：对局结束后不再持久化房间态，
+      // 避免 1 小时内同号房间被恢复成上一局终盘（"变盘"根因之一）
+      if (this.room.gameOver) { store.deleteRoomState(this.room.id); return; }
       const state = {
         currentTurn: this.room.currentTurn,
         gameOver: this.room.gameOver,
@@ -465,10 +471,16 @@ var ChessRoom = class {
     } catch (e) {}
   }
   handleConnection(ws) {
-    const roomId = this.roomId;
-    this.initRoom(roomId).then(() => {
+    this._ensureLive().then(() => {
       this.handleRoomWebSocket(ws);
     }).catch(() => {});
+  }
+  /* 2026-11-15 对齐 x 站 cf-chess.js 的 _ensureLive：房间对象不存在时按需恢复，
+     避免房间对象丢失后所有消息被静默丢弃（表现为"卡死"）。 */
+  async _ensureLive() {
+    if (this.room) return;
+    if (!this._roomReady) this._roomReady = this.initRoom(this.roomId).catch(() => {});
+    try { await this._roomReady; } finally { this._roomReady = null; }
   }
   handleRoomWebSocket(ws) {
     // 每个连接一个 sid：老连接即使 close 事件迟到，也不会误删新座位的连接
@@ -501,6 +513,8 @@ var ChessRoom = class {
         ws._lastSeen = Date.now();
         if (socketData.sid) this._lastMsg.set(socketData.sid, Date.now());
         this._lastActive = Date.now();
+        await this._ensureLive();
+        if (!this.room) return;
         const data = JSON.parse(event.data);
         const eventName = data.event || data[0];
         const payload = data.payload || data[1];
@@ -512,8 +526,34 @@ var ChessRoom = class {
           if (this._cleanupTimer) { clearTimeout(this._cleanupTimer); this._cleanupTimer = null; }
           for (const [pws, p] of [...this.room.players]) {
             const st = pws.readyState;
-            const rep = pws._socketData && pws._socketData.replaced;
-            if (st === 2 || st === 3 || rep) this.room.players.delete(pws);
+            const sd = pws._socketData;
+            const rep = sd && sd.replaced;
+            // 2026-11-15 僵死连接（60s 无任何消息）按死座回收，避免占位导致"房间已满/无法加入"卡死
+            const stale = sd && sd.sid && this._staleSid(sd.sid);
+            if (st === 2 || st === 3 || rep || stale) this.room.players.delete(pws);
+          }
+          // 2026-11-15 对齐 x 站 cf-chess.js：房间已结束且没有活人坐着时，建房即重开新局，
+          // 否则新玩家会继承上一局的终盘/走子历史（"变盘"根因之二）
+          let anyLiveSeated = false;
+          for (const [pws2] of this.room.players) {
+            const d2 = pws2._socketData;
+            if (pws2.readyState === 1 && d2 && !d2.replaced && !(d2.sid && this._staleSid(d2.sid))) { anyLiveSeated = true; break; }
+          }
+          if (!anyLiveSeated && this.room.gameOver) {
+            this.room.gameOver = false;
+            this.room.winner = null;
+            this.room._gameEndedAt = null;
+            this.room.currentTurn = 'red';
+            this.room.redTime = 900;
+            this.room.blkTime = 900;
+            this.room.moveHistory = [];
+            this.room.capturedRed = [];
+            this.room.capturedBlack = [];
+            this.room.playerTokens = {};
+            this.room.gameStarted = false;
+            this.disconnected = {};
+            try { store.deleteRoomState(this.room.id); } catch (e) {}
+            logx('重置', this.room.id + ' 无活人且上局已结束 -> 重开新局');
           }
           let lastColor = null;
           if (payload && typeof payload === 'object' && payload.lastColor) {
@@ -535,6 +575,9 @@ var ChessRoom = class {
             this.room.players.set(ws, { id: Math.random().toString(36).slice(2), color: myColor, assignedAt: Date.now() });
             socketData.color = myColor;
             ws.send(JSON.stringify({ event: 'room_created', data: { roomId: this.room.id, color: myColor, pid: myPid } }));
+            // 2026-11-15 对齐 x 站：建房后立刻回一份全量 room_state，
+            // 避免前端只凭 room_created 建盘而与服务端历史分叉
+            try { ws.send(JSON.stringify({ event: 'room_state', data: { ...this.getRoomState(), color: myColor, pid: myPid } })); } catch (e) {}
             diag.conns++;
             logx('建房', this.room.id + ' ' + myColor + ' sid=' + socketData.sid);
             this.ctx.waitUntil(this._regUpdate(this.room.players.size >= 2 ? 'playing' : 'waiting'));
@@ -549,6 +592,9 @@ var ChessRoom = class {
             this.room.players.set(ws, { id: Math.random().toString(36).slice(2), color: myColor, assignedAt: Date.now() });
             socketData.color = myColor;
             ws.send(JSON.stringify({ event: 'room_created', data: { roomId: this.room.id, color: myColor, pid: myPid } }));
+            // 2026-11-15 对齐 x 站：建房后立刻回一份全量 room_state，
+            // 避免前端只凭 room_created 建盘而与服务端历史分叉
+            try { ws.send(JSON.stringify({ event: 'room_state', data: { ...this.getRoomState(), color: myColor, pid: myPid } })); } catch (e) {}
             diag.conns++;
             logx('建房', this.room.id + ' ' + myColor + ' sid=' + socketData.sid);
             this.ctx.waitUntil(this._regUpdate(this.room.players.size >= 2 ? 'playing' : 'waiting'));
@@ -557,8 +603,11 @@ var ChessRoom = class {
           if (this._cleanupTimer) { clearTimeout(this._cleanupTimer); this._cleanupTimer = null; }
           for (const [pws, p] of [...this.room.players]) {
             const st = pws.readyState;
-            const rep = pws._socketData && pws._socketData.replaced;
-            if (st === 2 || st === 3 || rep) this.room.players.delete(pws);
+            const sd = pws._socketData;
+            const rep = sd && sd.replaced;
+            // 2026-11-15 僵死连接（60s 无任何消息）按死座回收，避免占位导致"房间已满/无法加入"卡死
+            const stale = sd && sd.sid && this._staleSid(sd.sid);
+            if (st === 2 || st === 3 || rep || stale) this.room.players.delete(pws);
           }
           if (this.room.players.size === 0) {
             ws.send(JSON.stringify({ event: 'error', data: '\u623F\u95F4\u4E0D\u5B58\u5728' }));
@@ -577,7 +626,7 @@ var ChessRoom = class {
           this.room.playerTokens[color] = joinPid;
           this.room.players.set(ws, { id: Math.random().toString(36).slice(2), color, assignedAt: Date.now() });
           socketData.color = color;
-          if (this.room.players.size >= 2) this.room.gameStarted = true;
+          if (this.room.players.size >= 2 && !this.room.gameOver) this.room.gameStarted = true;
           ws.send(JSON.stringify({ event: 'room_joined', data: { roomId: this.room.id, color, pid: joinPid } }));
           diag.conns++;
           logx('加入', this.room.id + ' ' + color + ' sid=' + socketData.sid);
@@ -598,11 +647,20 @@ var ChessRoom = class {
             ws.send(JSON.stringify({ event: 'move_rejected', data: { reason: 'invalid_state' } }));
             return;
           }
-          if (!socketData.color) {
-            for (const [pws, player] of this.room.players) {
-              if (pws === ws) { socketData.color = player.color; break; }
-            }
+          // 2026-11-15 对齐 x 站 cf-chess.js：走子前以 players 里的实际座位为准校正颜色。
+          // 旧连接/重连残留的 socketData.color 会造成错色走子（双方棋盘错位、走棋回退）
+          if (socketData.replaced) {
+            diag.moveRejects++;
+            logx('拒走', 'replaced sid=' + socketData.sid);
+            ws.send(JSON.stringify({ event: 'move_rejected', data: { reason: 'replaced' } }));
+            return;
           }
+          let authColor = null;
+          for (const [pws, player] of this.room.players) {
+            if (pws === ws) { authColor = player.color; break; }
+          }
+          if (!authColor) authColor = socketData.color || null;
+          if (authColor && socketData.color !== authColor) socketData.color = authColor;
           if (!socketData.color) {
             diag.moveRejects++;
             logx('拒走', 'no_color sid=' + socketData.sid);
@@ -620,7 +678,7 @@ var ChessRoom = class {
           if (this.room.currentTurn !== socketData.color) {
             diag.moveRejects++;
             logx('拒走', 'not_your_turn turn=' + this.room.currentTurn + ' me=' + socketData.color + ' sid=' + socketData.sid);
-            ws.send(JSON.stringify({ event: 'move_rejected', data: { reason: 'not_your_turn' } }));
+            ws.send(JSON.stringify({ event: 'move_rejected', data: { reason: 'not_your_turn', yourColor: socketData.color || null, currentTurn: this.room.currentTurn, histLen: this.room.moveHistory.length } }));
             return;
           }
           const move = { ...payload, timestamp: Date.now() };
@@ -637,7 +695,9 @@ var ChessRoom = class {
           if (move.gameOver) {
             this.room.gameOver = true;
             this.room._gameEndedAt = Date.now();
-            this.room.winner = move.winner;
+            // 2026-11-15 对齐 x 站 cf-chess.js：胜方由服务端判定（走子方获胜），不信任前端传值。
+            // 前端 move.winner 缺失时会传 null/undefined，旧逻辑会写下 null 胜者 -> 前端误显示"黑方胜"
+            this.room.winner = (move.winner === 'draw') ? 'draw' : socketData.color;
             if (this.room._timer) { clearInterval(this.room._timer); this.room._timer = null; }
           }
           const opponentMove = { ...move, redLeft: this.room.redTime, blkLeft: this.room.blkTime };
