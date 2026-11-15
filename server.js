@@ -857,7 +857,9 @@ var ChessRoom = class {
             return;
           }
           if (this.disconnected[color]) delete this.disconnected[color];
-          if (this.room._disconnectTimer) { clearTimeout(this.room._disconnectTimer); this.room._disconnectTimer = null; }
+          // 不再 clearTimeout 房间的断线巡检：任何一方重连都会把别人 180s 的判负计时冲掉，
+          // 导致断线方永远不判负、房间永远挂在"等待对手"。巡检自己按 disconnected 判断，重连方已被 delete 不会误判。
+          this._startDisconnectWatch();
           let rotatedPid = null;
           const pidMatches = !!(payload.pid && this.room.playerTokens && this.room.playerTokens[color] === payload.pid);
           if (!pidMatches) {
@@ -948,29 +950,39 @@ var ChessRoom = class {
       this._saveRoomState();
       this.ctx.waitUntil(this._regUpdate(this.room.players.size >= 2 ? 'playing' : 'waiting'));
       if (!this.room._disconnectTimer) {
-        this.room._disconnectTimer = setTimeout(() => {
-          if (!this.room || this.room.gameOver) return;
-          const now = Date.now();
-          for (const color of ['red', 'black']) {
-            if (this.disconnected[color] && now - this.disconnected[color] > 18e4) {
-              this.room.gameOver = true;
-              this.room._gameEndedAt = now;
-              this.room.winner = color === 'red' ? 'black' : 'red';
-              logx('判负', this.roomId + ' ' + color + ' 断线超过180s');
-              this.broadcastToRoom(JSON.stringify({ event: 'game_over', data: { winner: this.room.winner, reason: 'disconnect_timeout' } }));
-              this.broadcastToRoom(JSON.stringify({ event: 'room_timeout', data: {} }));
-              if (this.room._timer) { clearInterval(this.room._timer); this.room._timer = null; }
-              this._saveRoomState();
-              break;
-            }
-          }
-          this.room._disconnectTimer = null;
-        }, 183e3);
+        this._startDisconnectWatch();
       }
     };
     ws.onerror = () => {
       stopHeartbeat();
     };
+  }
+  /* 断线巡检：每 5s 检查一次，断线超 180s 判负；结束后房间从大厅撤下并清掉持久化终局。
+     用循环巡检而非一次性 183s 定时器 —— 后者会被对方重连 clearTimeout 冲掉，是房间"卡住不退出"的根因。 */
+  _startDisconnectWatch() {
+    if (!this.room || this.room._disconnectTimer) return;
+    const watch = () => {
+      if (!this.room) return;
+      if (this.room.gameOver) { this.room._disconnectTimer = null; return; }
+      const now = Date.now();
+      for (const color of ['red', 'black']) {
+        if (this.disconnected[color] && now - this.disconnected[color] > 18e4) {
+          this.room.gameOver = true;
+          this.room._gameEndedAt = now;
+          this.room.winner = color === 'red' ? 'black' : 'red';
+          logx('判负', this.roomId + ' ' + color + ' 断线超过180s -> ' + this.room.winner + ' 胜');
+          this.broadcastToRoom(JSON.stringify({ event: 'game_over', data: { winner: this.room.winner, reason: 'disconnect_timeout' } }));
+          this.broadcastToRoom(JSON.stringify({ event: 'room_timeout', data: {} }));
+          if (this.room._timer) { clearInterval(this.room._timer); this.room._timer = null; }
+          this.room._disconnectTimer = null;
+          try { store.deleteRoomState(this.room.id); } catch (e) {}
+          this.ctx.waitUntil(this._regUpdate(null));
+          return;
+        }
+      }
+      this.room._disconnectTimer = setTimeout(watch, 5e3);
+    };
+    this.room._disconnectTimer = setTimeout(watch, 5e3);
   }
   /* ===== 2026-11-10 座位治理（对齐 x 站 cf-chess.js 的 sid/_staleSid/_syncSockets） ===== */
   _liveSids() {
