@@ -104,7 +104,10 @@ const store = {
     for (const id in this.data.rooms_registry) {
       const r = this.data.rooms_registry[id];
       if (r.updated_at > since) {
-        rows.push({ id: r.id, red: r.red, black: r.black, status: r.status, watchers: r.watchers, updated_at: r.updated_at });
+        rows.push({
+          id: r.id, red: r.red, black: r.black, status: r.status, watchers: r.watchers, updated_at: r.updated_at,
+          redOffline: r.redOffline || 0, blackOffline: r.blackOffline || 0
+        });
       }
     }
     rows.sort((a, b) => b.updated_at - a.updated_at);
@@ -470,16 +473,22 @@ var ChessRoom = class {
   async _regUpdate(status) {
     const rid = this.room ? this.room.id : null;
     if (!rid) return;
-    const hasRed = [...this.room.players.values()].some((p) => p.color === 'red');
-    const hasBlack = [...this.room.players.values()].some((p) => p.color === 'black');
-    const rn = hasRed ? '\u5DF2\u5165\u5EA7' : '';
-    const bn = hasBlack ? '\u5DF2\u5165\u5EA7' : '';
+    const seatOf = (c) => [...this.room.players.values()].find((p) => p.color === c) || null;
+    const rs = seatOf('red');
+    const bs = seatOf('black');
+    const rn = rs ? '\u5DF2\u5165\u5EA7' : '';
+    const bn = bs ? '\u5DF2\u5165\u5EA7' : '';
     const watchers = this.room.spectators ? this.room.spectators.size : 0;
     try {
       if (status === null) {
         store.regUpdate(rid, null);
       } else {
-        store.regUpdate(rid, { id: rid, red: rn, black: bn, status: status, watchers: watchers, updated_at: Date.now() });
+        // 2026-11-16 附带断线时间戳，供 /api/rooms 实时换算"已断线(剩 Ns)"，避免文本僵住
+        store.regUpdate(rid, {
+          id: rid, red: rn, black: bn, status: status, watchers: watchers, updated_at: Date.now(),
+          redOffline: rs && rs.disconnectedAt ? rs.disconnectedAt : 0,
+          blackOffline: bs && bs.disconnectedAt ? bs.disconnectedAt : 0
+        });
       }
     } catch (e) {}
   }
@@ -627,7 +636,9 @@ var ChessRoom = class {
             const rep = sd && sd.replaced;
             // 2026-11-15 僵死连接（60s 无任何消息）按死座回收，避免占位导致"房间已满/无法加入"卡死
             const stale = sd && sd.sid && this._staleSid(sd.sid);
-            if (st === 2 || st === 3 || rep || stale) this.room.players.delete(pws);
+            // 2026-11-16 断线保留期（<180s）内不回收：座位冻结给原玩家重连，陌生人只能观战
+            const held = !!(p && p.disconnectedAt && Date.now() - p.disconnectedAt < 18e4);
+            if (!held && (st === 2 || st === 3 || rep || stale)) this.room.players.delete(pws);
           }
           if (this.room.players.size === 0) {
             ws.send(JSON.stringify({ event: 'error', data: '\u623F\u95F4\u4E0D\u5B58\u5728' }));
@@ -957,7 +968,13 @@ var ChessRoom = class {
       }
       if (!this.room || !socketData.color) return;
       if (socketData.replaced) return;
-      this.room.players.delete(ws);
+      // 2026-11-16 断线不再立即删座位：删掉会让大厅显示"空座/等待中"，陌生人在 180s 窗口内
+      // 能直接坐进来接管进行中的残局。改为保留座位并打 disconnectedAt 标记，等判负才清场。
+      const seat = this.room.players.get(ws)
+        || { id: Math.random().toString(36).slice(2), color: socketData.color, assignedAt: Date.now() };
+      seat.disconnectedAt = Date.now();
+      seat.offline = true;
+      if (!this.room.players.has(ws)) this.room.players.set(ws, seat);
       logx('断开', this.roomId + ' ' + socketData.color + ' sid=' + socketData.sid
         + ' code=' + (ev && ev.code)
         + ' reason=' + (ws._closeReason || (ev && ev.peer ? 'peer_close' : '-')));
@@ -1035,7 +1052,10 @@ var ChessRoom = class {
         if (ws.readyState === 2 || ws.readyState === 3) this._sockets.delete(ws);
       }
       if (this.room) {
-        for (const [pws] of [...this.room.players]) {
+        for (const [pws, p] of [...this.room.players]) {
+          // 2026-11-16 断线保留期内的座位不能被 prune 掉：重连方触发 _pruneSockets 时
+          // 会把"对方"的保留座一起删，等于又给陌生人开了空座。
+          if (p && p.disconnectedAt && Date.now() - p.disconnectedAt < 18e4) continue;
           if (pws.readyState === 2 || pws.readyState === 3) {
             if (pws._socketData) pws._socketData.replaced = true;
             this.room.players.delete(pws);
@@ -1335,7 +1355,16 @@ async function handleApiRequest(req, res, url) {
   }
   if (p === '/api/rooms') {
     try {
-      const rows = store.listRooms(Date.now() - 12e5);
+      const now = Date.now();
+      const markOffline = (ts) => (ts ? '\u5DF2\u65AD\u7EBF(\u5269' + Math.max(0, Math.ceil((18e4 - (now - ts)) / 1000)) + 's)' : null);
+      const rows = store.listRooms(now - 12e5).map((r) => {
+        const out = { id: r.id, red: r.red, black: r.black, status: r.status, watchers: r.watchers, updated_at: r.updated_at };
+        const ro = markOffline(r.redOffline);
+        const bo = markOffline(r.blackOffline);
+        if (ro) out.red = ro;
+        if (bo) out.black = bo;
+        return out;
+      });
       jsonRes(res, { rooms: rows });
       return;
     } catch (e) {}
